@@ -5,8 +5,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import os
-import tempfile
-import imageio
 
 # ==========================================
 # 1. ARCHITECTURE (Must match trained model)
@@ -70,18 +68,15 @@ def generate_complex_terrain(size=64, seed=None):
     if seed: np.random.seed(seed)
     # Forest
     low_res_f = np.random.rand(8, 8)
-    # TWEAK: Updated to Image.Resampling.BICUBIC for modern Pillow compatibility
-    forest_noise = np.array(Image.fromarray(low_res_f).resize((size, size), Image.Resampling.BICUBIC))
+    forest_noise = np.array(Image.fromarray(low_res_f).resize((size, size), Image.BICUBIC))
     forest_channel = (forest_noise > 0.4).astype(np.float32)
-    
     # Elevation
     low_res_e = np.random.rand(4, 4)
-    elev_noise = np.array(Image.fromarray(low_res_e).resize((size, size), Image.Resampling.BICUBIC))
+    elev_noise = np.array(Image.fromarray(low_res_e).resize((size, size), Image.BICUBIC))
     elev_channel = elev_noise ** 2
     elev_channel[elev_channel < 0.2] = 0.0
     if elev_channel.max() > 0:
         elev_channel = (elev_channel - elev_channel.min()) / (elev_channel.max() - elev_channel.min())
-        
     # Roads
     roads_channel = np.zeros((size, size), dtype=np.float32)
     if np.random.rand() > 0.4:
@@ -146,9 +141,7 @@ with st.sidebar:
     impact = st.slider("Road Impact", 0.5, 2.0, 1.0)
     steps = st.slider("Speed", 1, 6, 2)
     use_physics = st.toggle("Slope Physics", value=True)
-    if st.button("New Map"): 
-        st.cache_resource.clear()
-        st.rerun()
+    if st.button("New Map"): st.cache_resource.clear(); st.rerun()
 
 st.title("🛰️ NCA Deforestation Lab")
 col1, col2 = st.columns([1, 1])
@@ -177,11 +170,13 @@ with col2:
     stats = st.container()
     
     if st.button("Run Simulation", type="primary"):
+        import tempfile, imageio
+        
         # 1. User Input parsing
         new_roads = torch.zeros(1, 1, 64, 64)
         if canvas.image_data is not None:
-             # TWEAK: Updated Image.NEAREST to Image.Resampling.NEAREST
-            user_draw = Image.fromarray(canvas.image_data.astype('uint8')).resize((64, 64), Image.Resampling.NEAREST)
+             # Resize canvas to 64x64
+            user_draw = Image.fromarray(canvas.image_data.astype('uint8')).resize((64, 64), Image.NEAREST)
             user_arr = np.array(user_draw)
             # Detect red lines (Channel 0 > 50)
             if user_arr.shape[2] >= 3:
@@ -216,7 +211,7 @@ with col2:
             
             img[r>0.5] = [255,255,255] # White Roads
             
-            pil = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)).resize((300,300), Image.Resampling.NEAREST)
+            pil = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)).resize((300,300), Image.NEAREST)
             frames_list.append(pil)
             
         # Display
