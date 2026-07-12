@@ -13,38 +13,45 @@ class CAModel(torch.nn.Module):
         self.channel_n = channel_n
         self.fire_rate = fire_rate
         
-        self.fc1 = torch.nn.Conv2d(channel_n * 3, 128, 1)
-        self.fc2 = torch.nn.Conv2d(128, channel_n, 1)
+        # Sobel Filters as fixed parameters
+        Kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32) / 8.0
+        Ky = Kx.t()
+        self.register_buffer('Kx', Kx)
+        self.register_buffer('Ky', Ky)
         
-        # Initialize weights to zero to ensure stability at the beginning
+        # Perceive convolution (Groups=channel_n to act like depthwise convolution)
+        self.perceive_conv = torch.nn.Conv2d(channel_n, channel_n * 2, kernel_size=3, padding=1, bias=False)
+        
+        # Dense layers configured as 1x1 convolutions
+        self.w1 = torch.nn.Conv2d(channel_n * 3, 128, kernel_size=1)
+        self.w2 = torch.nn.Conv2d(128, channel_n, kernel_size=1)
+        
+        # Initialize weights to zero for stability
         with torch.no_grad():
-            self.fc2.weight.fill_(0.0)
-            self.fc2.bias.fill_(0.0)
+            self.w2.weight.fill_(0.0)
+            self.w2.bias.fill_(0.0)
             
         self.to(device)
 
     def perceive(self, x):
-        # Sobel filters for spatial gradients
-        sobel_x = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32) / 8.0
-        sobel_y = sobel_x.t()
+        # Reconstruct weights dynamically using registered buffers
+        w = torch.stack([self.Kx, self.Ky], dim=0)
+        w = w.repeat(self.channel_n, 1, 1, 1).to(self.device)
         
-        w1 = torch.stack([sobel_x, sobel_y], dim=0)
-        w = w1.repeat(self.channel_n, 1, 1, 1).to(self.device)
-        
+        # Apply depthwise spatial filtering
         g = torch.nn.functional.conv2d(x, w, groups=self.channel_n, padding=1)
         return torch.cat([x, g], dim=1)
 
     def forward(self, x, steps=1, distort_mask=None):
         for _ in range(steps):
             y = self.perceive(x)
-            y = torch.relu(self.fc1(y))
-            y = self.fc2(y)
+            y = torch.relu(self.w1(y))
+            y = self.w2(y)
             
-            # Stochastic update (cellular automata behavior)
+            # Stochastic update mask
             update_mask = torch.rand(x.size(0), 1, x.size(2), x.size(3), device=self.device) < self.fire_rate
             x = x + y * update_mask.float()
             
-            # Re-apply distortion mask if provided (for testing robustness)
             if distort_mask is not None:
                 x = x * distort_mask
                 
