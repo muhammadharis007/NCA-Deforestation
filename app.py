@@ -207,7 +207,7 @@ with col2:
             
             loss = np.clip(initial - f, 0, 1)
             loss[loss<0.1] = 0
-            img[:,0] = np.maximum(img[:,0], (loss*255).astype(np.uint8)) # Red Fire
+            img[:, :, 0] = np.maximum(img[:, :, 0], (loss*255).astype(np.uint8)) # Red Fire
             
             img[r>0.5] = [255,255,255] # White Roads
             
