@@ -1,412 +1,229 @@
 import streamlit as st
-import torch
-import torch.nn.functional as F
 import numpy as np
-import cv2
-import time
-import pandas as pd
-import plotly.express as px
-import plotly.graph_objects as go
-from streamlit_drawable_canvas import st_canvas
-from perlin_noise import PerlinNoise
 from PIL import Image
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import os
+import tempfile
+import imageio
 
-# ==============================================================================
-# 1. PAGE CONFIGURATION & CUSTOM CSS
-# ==============================================================================
-st.set_page_config(
-    page_title="NCA Deforestation Simulator | Advanced Dashboard",
-    page_icon="🌲",
-    layout="wide",
-    initial_sidebar_state="expanded"
-)
-
-# Inject custom CSS for a more professional dashboard feel
-st.markdown("""
-    <style>
-    .main-header { font-size: 2.5rem; font-weight: 700; color: #2E8B57; margin-bottom: 0px; }
-    .sub-header { font-size: 1.2rem; font-weight: 400; color: #555555; margin-bottom: 30px; }
-    .metric-card { background-color: #1E1E1E; padding: 20px; border-radius: 10px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); }
-    .stProgress .st-bo { background-color: #2E8B57; }
-    div[data-testid="stImage"] img { border: 2px solid #333; border-radius: 8px; }
-    </style>
-""", unsafe_allow_html=True)
-
-# ==============================================================================
-# 2. NEURAL CELLULAR AUTOMATA ARCHITECTURE (RESEARCH NCA)
-# ==============================================================================
-class CAModel(torch.nn.Module):
-    """
-    Neural Cellular Automata designed to simulate deforestation dynamics.
-    Utilizes localized perception via Sobel filters and 1x1 convolutions 
-    to map complex non-linear spatial interactions.
-    """
-    def __init__(self, channels=32, device='cpu'):
+# ==========================================
+# 1. ARCHITECTURE (Must match trained model)
+# ==========================================
+class ResearchNCA(nn.Module):
+    def __init__(self, channels=32):
         super().__init__()
-        self.device = device
         self.channels = channels
-        
-        # ---------------------------------------------------------
-        # Spatial Perception Filters (Sobel X and Y)
-        # ---------------------------------------------------------
-        self.sobel_x = torch.tensor([[-1, 0, 1], 
-                                     [-2, 0, 2], 
-                                     [-1, 0, 1]], dtype=torch.float32).view(1, 1, 3, 3) / 8.0
-        self.sobel_y = self.sobel_x.transpose(2, 3)
+        self.sobel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32).view(1,1,3,3)/8.0
+        self.sobel_y = self.sobel_x.transpose(2,3)
         self.register_buffer('Kx', self.sobel_x)
         self.register_buffer('Ky', self.sobel_y)
-
-        # ---------------------------------------------------------
-        # Learnable Layers
-        # ---------------------------------------------------------
-        # Perceive convolution WITH bias (matches checkpoint exactly)
-        self.perceive_conv = torch.nn.Conv2d(channels, channels, kernel_size=3, padding=1)
-        
-        # 1x1 Convolutions mapping 130 channels -> 128 channels -> 32 channels
-        # 130 comes from: (32 original * 4 perception vectors) + 2 static features
-        self.w1 = torch.nn.Conv2d((channels * 4) + 2, 128, kernel_size=1)
-        self.w2 = torch.nn.Conv2d(128, channels, kernel_size=1)
-        
-        # Move model to designated device (CPU for Streamlit cloud)
-        self.to(device)
+        self.perceive_conv = nn.Conv2d(channels, channels, 3, padding=1)
+        self.w1 = nn.Conv2d((channels*4)+2, 128, 1)
+        self.w2 = nn.Conv2d(128, channels, 1)
 
     def perceive(self, state):
-        """
-        Calculates the perception vector for each cell.
-        Returns concatenation of: [identity, grad_x, grad_y, learned_perception]
-        """
         k = state.shape[1]
-        # Calculate spatial gradients
-        x_grad = F.conv2d(state, self.Kx.repeat(k, 1, 1, 1), padding=1, groups=k)
-        y_grad = F.conv2d(state, self.Ky.repeat(k, 1, 1, 1), padding=1, groups=k)
-        # Apply learned spatial filter
+        x_grad = F.conv2d(state, self.Kx.repeat(k,1,1,1), padding=1, groups=k)
+        y_grad = F.conv2d(state, self.Ky.repeat(k,1,1,1), padding=1, groups=k)
         learned = self.perceive_conv(state)
-        
         return torch.cat([state, x_grad, y_grad, learned], dim=1)
 
     def get_slope(self, state):
-        """
-        Extracts elevation map (channel 2) and calculates geographical slope magnitude.
-        Used to calculate resistance to human infrastructure expansion.
-        """
         elev = state[:, 2:3]
         dx = F.conv2d(elev, self.Kx, padding=1)
         dy = F.conv2d(elev, self.Ky, padding=1)
         return torch.sqrt(dx**2 + dy**2)
 
-    def forward(self, state, steps=1, use_physics=True):
-        """
-        Executes the cellular automata simulation forward in time.
-        """
-        # Channel 0: Forest Cover (Dynamic)
-        # Channel 1: Roads/Infrastructure (Static)
-        # Channel 2: Elevation (Static)
-        forest_init = state[:, 0:1].clone()
-        static_features = state[:, 1:3]
+    def forward(self, x, steps=32, impact_factor=1.0, use_physics=True):
+        forest_init = x[:, 0:1]
+        static = x[:, 1:3]
+        b, _, h, w = forest_init.shape
+        hidden = torch.zeros(b, self.channels - 1, h, w, device=x.device)
+        state = torch.cat([forest_init, hidden], dim=1)
         
-        # Calculate physics-based resistance once per run
-        slope_map = self.get_slope(state)
-        if slope_map.max() > 0: 
-            slope_map /= slope_map.max()
+        slope_map = self.get_slope(x)
+        if slope_map.max() > 0: slope_map /= slope_map.max()
 
         for step in range(steps):
-            # 1. Perception Phase
             perception = self.perceive(state)
-            model_input = torch.cat([perception, static_features], dim=1)
+            model_input = torch.cat([perception, static], dim=1)
+            update = self.w2(F.relu(self.w1(model_input)))
             
-            # 2. Update Phase
-            hidden = F.relu(self.w1(model_input))
-            update = self.w2(hidden)
-
-            # 3. Physics & Constraints Application
             if use_physics:
-                # Steep slopes resist deforestation expansion
-                resistance = 1.0 - (slope_map * 3.0)
+                resistance = 1.0 - (slope_map * 3.0) 
                 update = update * torch.clamp(resistance, 0.0, 1.0)
 
-            # 4. State Modification
-            state = state + update
+            state = state + (update * 0.5 * impact_factor)
+            state = torch.clamp(state, -1.0, 1.0)
             
-            # 5. Natural Constraints (Forests can't regrow in this strict model, only degrade)
             forest = torch.min(state[:, 0:1], forest_init).clamp(0, 1)
-            
-            # Reconstruct full state tensor
             state = torch.cat([forest, state[:, 1:]], dim=1)
 
-        return state, state[:, 0:1]
+        return state[:, 0:1], slope_map
 
-# ==============================================================================
-# 3. HELPER FUNCTIONS & PROCEDURAL GENERATION
-# ==============================================================================
+# ==========================================
+# 2. GENERATOR
+# ==========================================
+def generate_complex_terrain(size=64, seed=None):
+    if seed: np.random.seed(seed)
+    # Forest
+    low_res_f = np.random.rand(8, 8)
+    # TWEAK: Updated to Image.Resampling.BICUBIC for modern Pillow compatibility
+    forest_noise = np.array(Image.fromarray(low_res_f).resize((size, size), Image.Resampling.BICUBIC))
+    forest_channel = (forest_noise > 0.4).astype(np.float32)
+    
+    # Elevation
+    low_res_e = np.random.rand(4, 4)
+    elev_noise = np.array(Image.fromarray(low_res_e).resize((size, size), Image.Resampling.BICUBIC))
+    elev_channel = elev_noise ** 2
+    elev_channel[elev_channel < 0.2] = 0.0
+    if elev_channel.max() > 0:
+        elev_channel = (elev_channel - elev_channel.min()) / (elev_channel.max() - elev_channel.min())
+        
+    # Roads
+    roads_channel = np.zeros((size, size), dtype=np.float32)
+    if np.random.rand() > 0.4:
+        x = np.random.randint(10, 54)
+        roads_channel[:, x-1:x+1] = 1.0
+        forest_channel[roads_channel > 0.5] = 0.0
+
+    patch = np.zeros((3, size, size), dtype=np.float32)
+    patch[0] = forest_channel
+    patch[1] = roads_channel
+    patch[2] = elev_channel
+    return patch
+
+# ==========================================
+# 3. APP LOGIC
+# ==========================================
+st.set_page_config(layout="wide", page_title="NCA Lab")
+
 @st.cache_resource
-def load_nca_model(model_path):
-    """Safely loads the PyTorch weights into the CAModel architecture."""
-    try:
-        model = CAModel(channels=32, device='cpu')
-        checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
-        model.load_state_dict(checkpoint)
-        model.eval()
-        return model
-    except Exception as e:
-        st.error(f"Failed to load model weights: {e}")
-        st.stop()
-
-def generate_procedural_environment(grid_size, seed_offset=0):
-    """
-    Generates complex procedural terrain using multi-octave Perlin noise.
-    Creates both a Forest Map and an Elevation Map.
-    """
-    noise1 = PerlinNoise(octaves=4, seed=np.random.randint(0, 1000) + seed_offset)
-    noise2 = PerlinNoise(octaves=8, seed=np.random.randint(1000, 2000) + seed_offset)
+def load_resources():
+    model = ResearchNCA(channels=32)
+    status = "Model Loaded"
     
-    forest_map = np.zeros((grid_size, grid_size))
-    elevation_map = np.zeros((grid_size, grid_size))
+    # TRY TO LOAD WEIGHTS
+    model_path = "nca_best_of_both.pth"
     
-    for i in range(grid_size):
-        for j in range(grid_size):
-            # Generate Forest (Dense patches with some clearings)
-            f_val = noise1([i/grid_size, j/grid_size]) + 0.5 * noise2([i/grid_size, j/grid_size])
-            forest_map[i, j] = 1.0 if f_val > -0.1 else 0.0
-            
-            # Generate Elevation (Smoother gradients)
-            e_val = noise1([j/grid_size, i/grid_size]) # Swapped axes for variation
-            elevation_map[i, j] = np.clip((e_val + 0.5), 0.0, 1.0)
-            
-    # Convert to PyTorch tensors
-    f_tensor = torch.tensor(forest_map, dtype=torch.float32).view(1, 1, grid_size, grid_size)
-    e_tensor = torch.tensor(elevation_map, dtype=torch.float32).view(1, 1, grid_size, grid_size)
-    
-    return f_tensor, e_tensor
-
-def state_to_rgb(forest_tensor, roads_tensor, elevation_tensor=None, show_elevation=False):
-    """
-    Transforms the abstract mathematical tensors into a visual RGB image.
-    Handles blending of Forest, Roads, and optionally Elevation overlays.
-    """
-    forest = forest_tensor[0, 0].detach().cpu().numpy()
-    roads = roads_tensor[0, 0].detach().cpu().numpy()
-    
-    img = np.zeros((forest.shape[0], forest.shape[1], 3))
-    
-    if show_elevation and elevation_tensor is not None:
-        # Render elevation as a topological background (brown/yellow hints)
-        elev = elevation_tensor[0, 0].detach().cpu().numpy()
-        img[:, :, 0] = elev * 0.4 # Red channel
-        img[:, :, 1] = elev * 0.3 # Green channel
-        img[:, :, 2] = elev * 0.1 # Blue channel
-        
-        # Overlay forest heavily where it exists
-        img[:, :, 1] += forest * 0.7 
+    if os.path.exists(model_path):
+        try:
+            # map_location='cpu' is critical for local inference!
+            model.load_state_dict(torch.load(model_path, map_location='cpu'))
+        except Exception as e:
+            status = f"Weight Error: {e}"
     else:
-        # Standard rendering: Black background, Green forest
-        img[:, :, 1] = forest  
+        status = "⚠️ No weights found. Using random init (Untrained)."
+        
+    model.eval()
     
-    # Overlay infrastructure/roads (Bright Gray/White)
-    road_mask = roads > 0.5
-    img[road_mask] = [0.8, 0.8, 0.8] 
+    patch = generate_complex_terrain() 
+    tensor_patch = torch.nn.functional.interpolate(
+        torch.tensor(patch).unsqueeze(0).float(), size=(64,64)
+    )
     
-    img = np.clip(img, 0.0, 1.0)
-    return (img * 255).astype(np.uint8)
+    f_vis = np.clip(patch[0], 0, 1) * 255
+    r_vis = np.clip(patch[1], 0, 1) * 255
+    e_vis = np.clip(patch[2], 0, 1) * 255
+    
+    rgb = np.zeros((200, 200, 3), dtype=np.uint8)
+    rgb[:, :, 1] = torch.nn.functional.interpolate(torch.tensor(f_vis).unsqueeze(0).unsqueeze(0), size=(200,200)).squeeze().numpy().astype(np.uint8)
+    rgb[:, :, 0] = torch.nn.functional.interpolate(torch.tensor(r_vis).unsqueeze(0).unsqueeze(0), size=(200,200)).squeeze().numpy().astype(np.uint8)
+    rgb[:, :, 2] = torch.nn.functional.interpolate(torch.tensor(e_vis).unsqueeze(0).unsqueeze(0), size=(200,200)).squeeze().numpy().astype(np.uint8) // 3
+    
+    bg_image = Image.fromarray(rgb)
+    return model, bg_image, tensor_patch, status
 
-def calculate_forest_area(forest_tensor):
-    """Calculates the exact percentage of the grid covered by forest."""
-    forest_array = forest_tensor[0, 0].detach().cpu().numpy()
-    total_pixels = forest_array.size
-    active_pixels = np.sum(forest_array > 0.5)
-    return (active_pixels / total_pixels) * 100.0
+model, bg_image, real_tensor, status_msg = load_resources()
 
-# ==============================================================================
-# 4. UI SETUP & STATE MANAGEMENT
-# ==============================================================================
-st.markdown('<p class="main-header">🌲 Advanced NCA Deforestation Simulator</p>', unsafe_allow_html=True)
-st.markdown('<p class="sub-header">Research Dashboard | Developed by: Haris, Ahsan, Abdullah</p>', unsafe_allow_html=True)
-
-MODEL_PATH = "nca_best_of_both.pth"
-nca_model = load_nca_model(MODEL_PATH)
-
-# Global configuration constants
-GRID_SIZE = 64
-CANVAS_DISPLAY_SIZE = 400
-
-# Initialize core session state if it doesn't exist
-if 'environment_seed' not in st.session_state:
-    st.session_state.environment_seed = 0
-    st.session_state.base_state = torch.zeros((1, 32, GRID_SIZE, GRID_SIZE))
-    f_map, e_map = generate_procedural_environment(GRID_SIZE, seed_offset=0)
-    st.session_state.base_state[:, 0:1] = f_map
-    st.session_state.base_state[:, 2:3] = e_map
-    st.session_state.metrics_log = []
-
-# Sidebar configurations
+# SIDEBAR
 with st.sidebar:
-    st.title("🎛️ Simulation Controls")
-    
-    st.header("1. Environment Initialization")
-    if st.button("🎲 Generate New Terrain", use_container_width=True):
-        st.session_state.environment_seed += 1
-        f_map, e_map = generate_procedural_environment(GRID_SIZE, seed_offset=st.session_state.environment_seed)
-        st.session_state.base_state[:, 0:1] = f_map
-        st.session_state.base_state[:, 2:3] = e_map
-        st.session_state.metrics_log = [] # Reset metrics
+    st.header("⚙️ Settings")
+    st.caption(f"Status: {status_msg}")
+    frames = st.slider("Time Horizon", 5, 30, 15)
+    impact = st.slider("Road Impact", 0.5, 2.0, 1.0)
+    steps = st.slider("Speed", 1, 6, 2)
+    use_physics = st.toggle("Slope Physics", value=True)
+    if st.button("New Map"): 
+        st.cache_resource.clear()
         st.rerun()
-        
-    render_elevation = st.checkbox("Show Elevation Map Overlay", value=False)
-    
-    st.header("2. Dynamics Settings")
-    simulation_steps = st.slider("Total Ticks (Frames)", min_value=10, max_value=300, value=100, step=10)
-    animation_speed = st.slider("Animation Speed", min_value=0.01, max_value=0.2, value=0.05, format="%.2fs")
-    use_physics = st.checkbox("Enable Topographical Resistance", value=True, help="If enabled, steep elevations will slow down deforestation expansion.")
-    
-    st.header("3. Drawing Tools")
-    brush_size = st.slider("Brush Thickness", min_value=1, max_value=10, value=3)
-    
-    st.markdown("---")
-    st.markdown("**About this project:**\nThis simulator uses Neural Cellular Automata (a decentralized AI architecture) to predict the emergent, decentralized spread of deforestation based on initial infrastructure placement and geographic topology.")
 
-# ==============================================================================
-# 5. MAIN DASHBOARD WORKSPACE
-# ==============================================================================
-col1, col2 = st.columns([1.2, 1])
+st.title("🛰️ NCA Deforestation Lab")
+col1, col2 = st.columns([1, 1])
 
-# Left Column: Interactive Drawing Pad
+# CANVAS
 with col1:
-    st.subheader("Step 1: Plan Infrastructure")
-    st.write("Draw roads or logging camps on the canvas. The NCA will use this as the seed for deforestation.")
-    
-    # Render background for the canvas
-    bg_image = state_to_rgb(
-        st.session_state.base_state[:, 0:1], 
-        torch.zeros((1, 1, GRID_SIZE, GRID_SIZE)),
-        st.session_state.base_state[:, 2:3],
-        render_elevation
-    )
-    bg_image_resized = cv2.resize(bg_image, (CANVAS_DISPLAY_SIZE, CANVAS_DISPLAY_SIZE), interpolation=cv2.INTER_NEAREST)
-    
-    # Display the interactive canvas
-    canvas_result = st_canvas(
-        fill_color="rgba(255, 165, 0, 0.3)", 
-        stroke_width=brush_size,
-        stroke_color="#FFFFFF", # Drawing in white maps to roads in our array processing
-        background_image=Image.fromarray(bg_image_resized),
-        update_streamlit=True,
-        height=CANVAS_DISPLAY_SIZE,
-        width=CANVAS_DISPLAY_SIZE,
-        drawing_mode="freedraw",
-        key="infrastructure_canvas",
-    )
-    
-    # Calculate initial stats
-    initial_forest = calculate_forest_area(st.session_state.base_state[:, 0:1])
-    st.metric(label="Initial Forest Cover", value=f"{initial_forest:.1f}%")
+    st.subheader("1. Input")
+    st.image(bg_image, caption="Reference (Blue=Elevation)", width=300)
+    try:
+        from streamlit_drawable_canvas import st_canvas
+        # Canvas Logic
+        canvas = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.5)",
+            stroke_width=3,
+            stroke_color="#FF0000",
+            background_color="#000000", # Black background for easy parsing
+            height=300, width=300,
+            drawing_mode="freedraw", key="canvas"
+        )
+    except: st.error("Install streamlit-drawable-canvas")
 
-# Right Column: Live Simulation Execution
+# PREDICTION
 with col2:
-    st.subheader("Step 2: Execute NCA Simulation")
+    st.subheader("2. Forecast")
+    output_container = st.empty()
+    stats = st.container()
     
-    # UI Elements for the live animation
-    animation_placeholder = st.empty()
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-    
-    # Display the static initial state before running
-    if not canvas_result.image_data is None:
-        animation_placeholder.image(bg_image_resized, caption="Awaiting Simulation...", use_column_width=True)
-
-    if st.button("▶️ Launch Predictive Simulation", use_container_width=True, type="primary"):
-        # 1. Process the user's drawing
-        drawn_roads = np.zeros((GRID_SIZE, GRID_SIZE))
-        if canvas_result.image_data is not None:
-            # Resize the high-res canvas drawing down to our 64x64 tensor grid
-            canvas_img = cv2.resize(canvas_result.image_data, (GRID_SIZE, GRID_SIZE), interpolation=cv2.INTER_NEAREST)
-            # Alpha channel > 0 means the user drew there
-            drawn_roads = (canvas_img[:, :, 3] > 0).astype(np.float32)
-            
-        # 2. Setup the state tensor for the run
-        run_state = st.session_state.base_state.clone()
-        # Inject the drawn roads into Channel 1
-        run_state[:, 1:2] = torch.tensor(drawn_roads).view(1, 1, GRID_SIZE, GRID_SIZE) 
+    if st.button("Run Simulation", type="primary"):
+        # 1. User Input parsing
+        new_roads = torch.zeros(1, 1, 64, 64)
+        if canvas.image_data is not None:
+             # TWEAK: Updated Image.NEAREST to Image.Resampling.NEAREST
+            user_draw = Image.fromarray(canvas.image_data.astype('uint8')).resize((64, 64), Image.Resampling.NEAREST)
+            user_arr = np.array(user_draw)
+            # Detect red lines (Channel 0 > 50)
+            if user_arr.shape[2] >= 3:
+                new_roads = torch.tensor((user_arr[:,:,0]>50)).float().unsqueeze(0).unsqueeze(0)
         
-        # Reset logs for new run
-        st.session_state.metrics_log = []
+        # 2. Setup
+        curr_x = real_tensor.clone()
+        # Physics: Road destroys forest instantly
+        road_mask = (torch.max(curr_x[:,1], new_roads) > 0.5).float()
+        curr_x[:,1] = road_mask
+        curr_x[:,0] = curr_x[:,0] * (1.0 - road_mask)
         
-        # 3. Execution Loop
-        start_time = time.time()
-        for step in range(simulation_steps):
+        initial = curr_x[0,0].numpy().copy()
+        frames_list = []
+        
+        # 3. Loop
+        for i in range(frames):
             with torch.no_grad():
-                # Step the model forward exactly 1 tick
-                run_state, forest_pred = nca_model(run_state, steps=1, use_physics=use_physics)
+                curr_x[:,0:1], _ = model(curr_x, steps=steps, impact_factor=impact, use_physics=use_physics)
             
-            # Record analytics
-            current_forest_area = calculate_forest_area(forest_pred)
-            st.session_state.metrics_log.append({
-                "Tick": step + 1,
-                "Forest Cover (%)": current_forest_area
-            })
+            # Render
+            f = curr_x[0,0].numpy()
+            r = curr_x[0,1].numpy()
             
-            # Visual Rendering
-            frame = state_to_rgb(forest_pred, run_state[:, 1:2], run_state[:, 2:3], render_elevation)
-            frame_resized = cv2.resize(frame, (CANVAS_DISPLAY_SIZE, CANVAS_DISPLAY_SIZE), interpolation=cv2.INTER_NEAREST)
+            img = np.zeros((64,64,3), dtype=np.uint8) + [20,30,50]
+            mask_f = np.clip(f, 0, 1)[:, :, None]
+            img = img * (1-mask_f) + np.array([34, 139, 34]) * mask_f # Green
             
-            # Update UI dynamically (Creates the GIF effect)
-            animation_placeholder.image(frame_resized, caption=f"Processing Tick: {step+1} / {simulation_steps}", use_column_width=True)
-            progress_bar.progress((step + 1) / simulation_steps)
-            status_text.text(f"Live Forest Cover: {current_forest_area:.1f}%")
+            loss = np.clip(initial - f, 0, 1)
+            loss[loss<0.1] = 0
+            img[:,0] = np.maximum(img[:,0], (loss*255).astype(np.uint8)) # Red Fire
             
-            # Sleep dictates the visual framerate
-            time.sleep(animation_speed)
+            img[r>0.5] = [255,255,255] # White Roads
             
-        end_time = time.time()
-        st.success(f"Simulation Complete in {end_time - start_time:.2f} seconds!")
-
-# ==============================================================================
-# 6. POST-SIMULATION ANALYTICS DASHBOARD
-# ==============================================================================
-st.markdown("---")
-st.subheader("📊 Post-Simulation Analytics")
-
-if len(st.session_state.metrics_log) > 0:
-    # Convert recorded metrics to a Pandas DataFrame
-    df_metrics = pd.DataFrame(st.session_state.metrics_log)
-    
-    # Calculate overall loss
-    initial_cov = df_metrics.iloc[0]["Forest Cover (%)"]
-    final_cov = df_metrics.iloc[-1]["Forest Cover (%)"]
-    total_loss = initial_cov - final_cov
-    
-    # Display KPI Cards
-    kpi1, kpi2, kpi3 = st.columns(3)
-    kpi1.metric(label="Starting Cover", value=f"{initial_cov:.2f}%")
-    kpi2.metric(label="Ending Cover", value=f"{final_cov:.2f}%", delta=f"-{total_loss:.2f}%", delta_color="inverse")
-    kpi3.metric(label="Average Rate of Loss", value=f"{(total_loss / simulation_steps):.3f}% per tick")
-    
-    # Generate Interactive Plotly Chart
-    fig = px.line(
-        df_metrics, 
-        x="Tick", 
-        y="Forest Cover (%)", 
-        title="Deforestation Progression Over Time",
-        markers=True,
-        color_discrete_sequence=["#FF4B4B"]
-    )
-    fig.update_layout(
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
-        xaxis_title="Simulation Time (Ticks)",
-        yaxis_title="Forest Remaining (%)",
-        yaxis=dict(range=[0, 100])
-    )
-    fig.update_xaxes(showgrid=True, gridwidth=1, gridcolor='rgba(255,255,255,0.1)')
-    fig.update_yaxes(showgrid=True, gridwidth=1, gridcolor='rgba(255,255,255,0.1)')
-    
-    st.plotly_chart(fig, use_container_width=True)
-    
-    # Allow users to download the data
-    csv = df_metrics.to_csv(index=False).encode('utf-8')
-    st.download_button(
-        label="📥 Download Analytics CSV",
-        data=csv,
-        file_name='deforestation_metrics.csv',
-        mime='text/csv',
-    )
-else:
-    st.info("Run the simulation above to generate environmental impact analytics.")
+            pil = Image.fromarray(np.clip(img, 0, 255).astype(np.uint8)).resize((300,300), Image.Resampling.NEAREST)
+            frames_list.append(pil)
+            
+        # Display
+        with tempfile.NamedTemporaryFile(suffix=".gif", delete=False) as tmpfile:
+            np_frames = [np.array(f) for f in frames_list]
+            imageio.mimsave(tmpfile.name, np_frames, fps=15)
+            output_container.image(tmpfile.name, caption="Forecast")
+            
+        final_loss = ((np.sum(initial) - np.sum(f)) / np.sum(initial) * 100) if np.sum(initial) > 0 else 0
+        stats.metric("Projected Loss", f"{final_loss:.1f}%", delta_color="inverse")
