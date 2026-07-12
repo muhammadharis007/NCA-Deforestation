@@ -137,9 +137,9 @@ model, bg_image, real_tensor, status_msg = load_resources()
 with st.sidebar:
     st.header("⚙️ Settings")
     st.caption(f"Status: {status_msg}")
-    frames = st.slider("Time Horizon", 5, 30, 15)
-    impact = st.slider("Road Impact", 0.5, 2.0, 1.0)
-    steps = st.slider("Speed", 1, 6, 2)
+    frames = st.slider("Time Horizon", 1, 10, 5)
+    impact = st.slider("Road Impact", 0.4, 1.0, 1.0)
+    steps = st.slider("Speed", 1, 5, 2)
     use_physics = st.toggle("Slope Physics", value=True)
     if st.button("New Map"): st.cache_resource.clear(); st.rerun()
 
