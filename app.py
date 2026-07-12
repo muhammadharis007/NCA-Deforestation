@@ -7,56 +7,65 @@ from PIL import Image
 
 # ----------------- Model Architecture -----------------
 class CAModel(torch.nn.Module):
-    def __init__(self, channel_n=16, fire_rate=0.5, device='cpu'):
+    def __init__(self, channels=32, device='cpu'):
         super().__init__()
         self.device = device
-        self.channel_n = channel_n
-        self.fire_rate = fire_rate
+        self.channels = channels
         
-        # Sobel Filters as fixed parameters
-        Kx = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32) / 8.0
-        Ky = Kx.t()
-        self.register_buffer('Kx', Kx)
-        self.register_buffer('Ky', Ky)
+        # Sobel filters initialized to a 4D shape [1, 1, 3, 3]
+        self.sobel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32).view(1,1,3,3) / 8.0
+        self.sobel_y = self.sobel_x.transpose(2,3)
+        self.register_buffer('Kx', self.sobel_x)
+        self.register_buffer('Ky', self.sobel_y)
+
+        # Perceive convolution without bias
+        self.perceive_conv = torch.nn.Conv2d(channels, channels, 3, padding=1, bias=False)
         
-        # Perceive convolution (Groups=channel_n to act like depthwise convolution)
-        self.perceive_conv = torch.nn.Conv2d(channel_n, channel_n * 2, kernel_size=3, padding=1, bias=False)
+        # 1x1 Convolutions mapping 130 channels -> 128 channels -> 32 channels
+        self.w1 = torch.nn.Conv2d((channels * 4) + 2, 128, 1)
+        self.w2 = torch.nn.Conv2d(128, channels, 1)
         
-        # Dense layers configured as 1x1 convolutions
-        self.w1 = torch.nn.Conv2d(channel_n * 3, 128, kernel_size=1)
-        self.w2 = torch.nn.Conv2d(128, channel_n, kernel_size=1)
-        
-        # Initialize weights to zero for stability
-        with torch.no_grad():
-            self.w2.weight.fill_(0.0)
-            self.w2.bias.fill_(0.0)
-            
         self.to(device)
 
-    def perceive(self, x):
-        # Reconstruct weights dynamically using registered buffers
-        w = torch.stack([self.Kx, self.Ky], dim=0)
-        w = w.repeat(self.channel_n, 1, 1, 1).to(self.device)
+    def perceive(self, state):
+        k = state.shape[1]
+        x_grad = torch.nn.functional.conv2d(state, self.Kx.repeat(k,1,1,1), padding=1, groups=k)
+        y_grad = torch.nn.functional.conv2d(state, self.Ky.repeat(k,1,1,1), padding=1, groups=k)
+        learned = self.perceive_conv(state)
+        return torch.cat([state, x_grad, y_grad, learned], dim=1)
+
+    def get_slope(self, state):
+        elev = state[:, 2:3]
+        dx = torch.nn.functional.conv2d(elev, self.Kx, padding=1)
+        dy = torch.nn.functional.conv2d(elev, self.Ky, padding=1)
+        return torch.sqrt(dx**2 + dy**2)
+
+    def forward(self, x, steps=32, use_physics=False):
+        forest_init = x[:, 0:1]
+        static = x[:, 1:3]
+        b, _, h, w = forest_init.shape
+        hidden = torch.zeros(b, self.channels - 1, h, w, device=x.device)
+        state = torch.cat([forest_init, hidden], dim=1)
+
+        slope_map = self.get_slope(x)
+        if slope_map.max() > 0: 
+            slope_map /= slope_map.max()
+
+        for step in range(steps):
+            perception = self.perceive(state)
+            model_input = torch.cat([perception, static], dim=1)
+            update = self.w2(torch.nn.functional.relu(self.w1(model_input)))
+
+            if use_physics:
+                resistance = 1.0 - (slope_map * 3.0)
+                update = update * torch.clamp(resistance, 0.0, 1.0)
+
+            state = state + update
+            forest = torch.min(state[:, 0:1], forest_init).clamp(0, 1)
+            state = torch.cat([forest, state[:, 1:]], dim=1)
+
+        return state[:, 0:1]
         
-        # Apply depthwise spatial filtering
-        g = torch.nn.functional.conv2d(x, w, groups=self.channel_n, padding=1)
-        return torch.cat([x, g], dim=1)
-
-    def forward(self, x, steps=1, distort_mask=None):
-        for _ in range(steps):
-            y = self.perceive(x)
-            y = torch.relu(self.w1(y))
-            y = self.w2(y)
-            
-            # Stochastic update mask
-            update_mask = torch.rand(x.size(0), 1, x.size(2), x.size(3), device=self.device) < self.fire_rate
-            x = x + y * update_mask.float()
-            
-            if distort_mask is not None:
-                x = x * distort_mask
-                
-        return x
-
 # ----------------- Helper Functions -----------------
 @st.cache_resource
 def load_nca_model(model_path):
