@@ -1,8 +1,10 @@
 import streamlit as st
 import torch
-import torch.nn.functional as F
 import numpy as np
 import cv2
+import time
+from streamlit_drawable_canvas import st_canvas
+from perlin_noise import PerlinNoise
 
 # ----------------- Model Architecture (ResearchNCA) -----------------
 class CAModel(torch.nn.Module):
@@ -10,20 +12,13 @@ class CAModel(torch.nn.Module):
         super().__init__()
         self.device = device
         self.channels = channels
-        
-        # Sobel filters initialized to a 4D shape [1, 1, 3, 3]
         self.sobel_x = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], dtype=torch.float32).view(1,1,3,3) / 8.0
         self.sobel_y = self.sobel_x.transpose(2,3)
         self.register_buffer('Kx', self.sobel_x)
         self.register_buffer('Ky', self.sobel_y)
-
-        # Perceive convolution WITH bias (matches your checkpoint)
         self.perceive_conv = torch.nn.Conv2d(channels, channels, 3, padding=1)
-        
-        # 1x1 Convolutions mapping 130 channels -> 128 channels -> 32 channels
         self.w1 = torch.nn.Conv2d((channels * 4) + 2, 128, 1)
         self.w2 = torch.nn.Conv2d(128, channels, 1)
-        
         self.to(device)
 
     def perceive(self, state):
@@ -39,15 +34,11 @@ class CAModel(torch.nn.Module):
         dy = torch.nn.functional.conv2d(elev, self.Ky, padding=1)
         return torch.sqrt(dx**2 + dy**2)
 
-    def forward(self, x, steps=32, use_physics=False):
-        # x is expected to have 3 channels: [forest_cover, roads, elevation]
-        forest_init = x[:, 0:1]
-        static = x[:, 1:3]
-        b, _, h, w = forest_init.shape
-        hidden = torch.zeros(b, self.channels - 1, h, w, device=x.device)
-        state = torch.cat([forest_init, hidden], dim=1)
-
-        slope_map = self.get_slope(x)
+    def forward(self, state, steps=1, use_physics=True):
+        forest_init = state[:, 0:1].clone()
+        static = state[:, 1:3]
+        
+        slope_map = self.get_slope(state)
         if slope_map.max() > 0: 
             slope_map /= slope_map.max()
 
@@ -61,6 +52,7 @@ class CAModel(torch.nn.Module):
                 update = update * torch.clamp(resistance, 0.0, 1.0)
 
             state = state + update
+            # Enforce that forest cannot grow beyond its initial bound (deforestation only)
             forest = torch.min(state[:, 0:1], forest_init).clamp(0, 1)
             state = torch.cat([forest, state[:, 1:]], dim=1)
 
@@ -69,113 +61,112 @@ class CAModel(torch.nn.Module):
 # ----------------- Helper Functions -----------------
 @st.cache_resource
 def load_nca_model(model_path):
-    """Loads the pre-trained NCA model onto the CPU."""
-    # Here is the fix: Using channels=32 to match your initialized class!
     model = CAModel(channels=32, device='cpu')
     checkpoint = torch.load(model_path, map_location=torch.device('cpu'))
     model.load_state_dict(checkpoint)
     model.eval()
     return model
 
-def to_rgb(x_tensor):
-    """Converts 1-channel forest state to RGB for visualization"""
-    forest_map = x_tensor[0, 0].detach().cpu().numpy()
-    
-    # Create a simple colormap (Forest goes into the Green channel)
-    rgb = np.zeros((forest_map.shape[0], forest_map.shape[1], 3))
-    rgb[:, :, 1] = forest_map  
-    rgb = np.clip(rgb, 0.0, 1.0)
-    return (rgb * 255).astype(np.uint8)
+def generate_procedural_forest(grid_size):
+    """Generates a natural-looking procedural forest layout using Perlin Noise."""
+    noise = PerlinNoise(octaves=4, seed=np.random.randint(0, 1000))
+    forest_map = np.zeros((grid_size, grid_size))
+    for i in range(grid_size):
+        for j in range(grid_size):
+            val = noise([i/grid_size, j/grid_size])
+            # Threshold noise to create dense forest patches
+            forest_map[i, j] = 1.0 if val > -0.05 else 0.0 
+    return torch.tensor(forest_map, dtype=torch.float32).view(1, 1, grid_size, grid_size)
 
-def apply_damage(grid, damage_type="Circle", radius=10):
-    """Applies a specific visual deforestation damage."""
-    mask = torch.ones_like(grid[:, 0:1])
-    h, w = grid.shape[2], grid.shape[3]
-    cy, cx = h // 2, w // 2
+def state_to_rgb(forest_tensor, roads_tensor):
+    """Converts the NCA state to an RGB image (Green = Forest, Gray = Roads)"""
+    forest = forest_tensor[0, 0].detach().cpu().numpy()
+    roads = roads_tensor[0, 0].detach().cpu().numpy()
     
-    y, x = torch.meshgrid(torch.arange(h), torch.arange(w), indexing="ij")
-    dist = torch.sqrt((x - cx)**2 + (y - cy)**2)
+    img = np.zeros((forest.shape[0], forest.shape[1], 3))
+    img[:, :, 1] = forest  # Green channel for forest
     
-    if damage_type == "Circle":
-        mask[:, :, dist < radius] = 0.0
-    elif damage_type == "Half Cut":
-        mask[:, :, y > cy] = 0.0
-        
-    grid[:, 0:1] = grid[:, 0:1] * mask
-    return grid
+    # Overlay roads as gray
+    road_mask = roads > 0.5
+    img[road_mask] = [0.5, 0.5, 0.5] 
+    
+    img = np.clip(img, 0.0, 1.0)
+    return (img * 255).astype(np.uint8)
 
 # ----------------- Streamlit UI Configuration -----------------
-st.set_page_config(page_title="NCA Deforestation Dashboard", layout="wide")
-
-st.title("🌲 Neural Cellular Automata (NCA) Deforestation")
-st.markdown("### Developed by: **Muhammad Haris, Muhammad Ahsan Shaikh, Muhammad Abdullah**")
+st.set_page_config(page_title="NCA Deforestation Simulator", layout="wide")
+st.title("🌲 Interactive NCA Deforestation Simulator")
 
 MODEL_PATH = "nca_best_of_both.pth"
+nca_model = load_nca_model(MODEL_PATH)
+GRID_SIZE = 64
 
-try:
-    nca_model = load_nca_model(MODEL_PATH)
-    st.sidebar.success("✅ Pre-trained model loaded successfully!")
-except Exception as e:
-    st.sidebar.error(f"❌ Failed to load model file '{MODEL_PATH}'. Details: {e}")
-    st.stop()
+# Initialize session state
+if 'base_state' not in st.session_state:
+    st.session_state.base_state = torch.zeros((1, 32, GRID_SIZE, GRID_SIZE))
+    st.session_state.base_state[:, 0:1] = generate_procedural_forest(GRID_SIZE) # Procedural Forest
+    st.session_state.base_state[:, 2:3] = 0.5 # Flat elevation default
 
-# Sidebar Controls
-st.sidebar.header("🎛️ Simulation Configurations")
-grid_size = st.sidebar.slider("Grid Resolution (Square Size)", min_value=32, max_value=64, value=64, step=8)
-num_steps = st.sidebar.slider("NCA Iteration Steps", min_value=1, max_value=100, value=32, step=1)
-
-st.sidebar.header("💥 Deforestation Settings")
-enable_damage = st.sidebar.checkbox("Inflict Deforestation Damage", value=False)
-damage_type = st.sidebar.selectbox("Damage Shape Pattern", ["Circle", "Half Cut"], disabled=not enable_damage)
-damage_radius = st.sidebar.slider("Damage Impact Radius", min_value=5, max_value=20, value=10, disabled=(not enable_damage or damage_type=="Half Cut"))
-
-# Core Session state
-if 'ca_input' not in st.session_state or st.sidebar.button("♻️ Reset Landscape"):
-    # Input has 3 channels: [Forest, Roads, Elevation]
-    init_grid = torch.zeros((1, 3, grid_size, grid_size))
-    init_grid[:, 0, :, :] = 1.0  # Fully forested initially
-    
-    st.session_state.ca_input = init_grid
-    st.session_state.current_forest = init_grid[:, 0:1].clone()
-    st.session_state.history = [to_rgb(st.session_state.current_forest)]
-
-col1, col2 = st.columns(2)
+col1, col2 = st.columns([1, 1])
 
 with col1:
-    st.subheader("📺 Interactive Execution Workspace")
+    st.subheader("1. Draw Infrastructure (Roads/Logging Pads)")
+    st.write("Draw gray lines to simulate human roads cutting into the forest.")
     
-    if st.button("🚀 Run Prediction", use_container_width=True):
-        current_input = st.session_state.ca_input.clone()
-        
-        # Apply damage to the current forest state before running
-        if enable_damage:
-            current_input = apply_damage(current_input, damage_type, damage_radius)
-            st.warning(f"⚠️ Applied '{damage_type}' deforestation to the landscape.")
-            st.session_state.ca_input = current_input
-        
-        with st.spinner(f"Simulating {num_steps} cellular timesteps..."):
-            with torch.no_grad():
-                # Forward returns (full_state, forest_prediction)
-                _, predicted_forest = nca_model(current_input, steps=num_steps, use_physics=True)
-            
-            # Update the history and current forest state
-            st.session_state.ca_input[:, 0:1] = predicted_forest
-            st.session_state.current_forest = predicted_forest
-            st.session_state.history.append(to_rgb(predicted_forest))
-            
-    # Always render current status frame
-    current_img = to_rgb(st.session_state.current_forest)
-    upscaled_img = cv2.resize(current_img, (300, 300), interpolation=cv2.INTER_NEAREST)
-    st.image(upscaled_img, caption="Current Forest State", use_column_width=False)
+    # Render the current forest as the background of the canvas
+    bg_image = state_to_rgb(st.session_state.base_state[:, 0:1], torch.zeros((1,1,GRID_SIZE,GRID_SIZE)))
+    bg_image_resized = cv2.resize(bg_image, (400, 400), interpolation=cv2.INTER_NEAREST)
+    
+    # Interactive Drawing Pad
+    canvas_result = st_canvas(
+        fill_color="rgba(255, 165, 0, 0.3)",  # Fixed fill color
+        stroke_width=st.slider("Road Thickness", 1, 10, 3),
+        stroke_color="#808080", # Gray for roads
+        background_image=fromarray(bg_image_resized) if 'fromarray' in globals() else None,
+        update_streamlit=True,
+        height=400,
+        width=400,
+        drawing_mode="freedraw",
+        key="canvas",
+    )
 
 with col2:
-    st.subheader("⏳ Environmental History")
-    st.write(f"Total recorded key frames: {len(st.session_state.history)}")
+    st.subheader("2. Live Simulation Animation")
+    simulation_steps = st.slider("Animation Frames (Steps)", 10, 200, 60)
     
-    if len(st.session_state.history) > 1:
-        frame_idx = st.slider("Browse Timeline History", 0, len(st.session_state.history)-1, len(st.session_state.history)-1)
-        selected_img = st.session_state.history[frame_idx]
-        upscaled_hist = cv2.resize(selected_img, (300, 300), interpolation=cv2.INTER_NEAREST)
-        st.image(upscaled_hist, caption=f"Snapshot Frame #{frame_idx}", use_column_width=False)
-    else:
-        st.info("Run the simulation to generate timeline frames.")
+    if st.button("▶️ Play Deforestation Simulation", use_container_width=True):
+        # 1. Extract drawn roads from canvas
+        drawn_roads = np.zeros((GRID_SIZE, GRID_SIZE))
+        if canvas_result.image_data is not None:
+            # Resize canvas output back to grid size
+            canvas_img = cv2.resize(canvas_result.image_data, (GRID_SIZE, GRID_SIZE))
+            # Extract gray pixels as road paths
+            drawn_roads = (canvas_img[:, :, 0] > 0).astype(np.float32)
+        
+        # 2. Setup initial state for this run
+        run_state = st.session_state.base_state.clone()
+        run_state[:, 1:2] = torch.tensor(drawn_roads).view(1, 1, GRID_SIZE, GRID_SIZE) # Inject roads
+        
+        # 3. Create a placeholder for GIF-like animation
+        animation_placeholder = st.empty()
+        
+        # 4. Live animation loop
+        for step in range(simulation_steps):
+            with torch.no_grad():
+                # Step the model forward by exactly 1 tick
+                run_state, forest_pred = nca_model(run_state, steps=1, use_physics=True)
+            
+            # Render current frame
+            frame = state_to_rgb(forest_pred, run_state[:, 1:2])
+            frame_resized = cv2.resize(frame, (400, 400), interpolation=cv2.INTER_NEAREST)
+            
+            # Update the image in place to create GIF effect
+            animation_placeholder.image(frame_resized, caption=f"Tick: {step+1} / {simulation_steps}")
+            
+            # Tiny sleep to make the animation viewable
+            time.sleep(0.05)
+            
+        st.success("Simulation Complete!")
+
+# Add Pillow image handler globally for canvas background
+from PIL.Image import fromarray

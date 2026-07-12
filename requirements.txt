@@ -3,3 +3,5 @@ torch
 numpy
 opencv-python-headless
 Pillow
+streamlit-drawable-canvas
+perlin-noise
