@@ -1,9 +1,9 @@
-streamlit==1.35.0
+streamlit
 torch
 numpy
 opencv-python-headless
 Pillow
-streamlit-drawable-canvas
+streamlit-drawable-canvas==0.9.3
 perlin-noise
 plotly
 pandas
